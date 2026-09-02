@@ -1,0 +1,375 @@
+name: 自动部署代理到Unikraft
+
+run-name: 自动部署代理到Unikraft
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: '应用源码仓库（默认 eooce/nodejs-argo）'
+        required: false
+        default: 'eooce/nodejs-argo'
+      ref:
+        description: '源码分支/标签'
+        required: false
+        default: 'main'
+      metro:
+        description: '部署区域 metro（sin / fra / sfo / dal / was 等）'
+        required: true
+        default: 'sfo'
+      image_org:
+        description: '镜像组织（Unikraft 控制台用户名，如 toyyer；留空用变量 UKC_IMAGE_ORG）'
+        required: false
+        default: ''
+      image_name:
+        description: '镜像名（默认 nodejs）'
+        required: false
+        default: 'nodejs'
+      image_tag:
+        description: '镜像标签（发版建议 v1/v2 递增）'
+        required: false
+        default: 'latest'
+      app_name:
+        description: '实例名（留空自动生成；重复运行先删同名旧实例）'
+        required: false
+        default: ''
+      memory:
+        description: '内存（免费额度 16MiB-8GiB）'
+        required: false
+        default: '512MiB'
+      vcpus:
+        description: 'vCPU 数（免费额度通常 1）'
+        required: false
+        default: '1'
+      publish:
+        description: '端口映射 源:容器/处理器（如 80:3000/http 或 443:3000/http+tls）'
+        required: false
+        default: '443:3000/http+tls'
+      scale_to_zero:
+        description: '缩零策略：off=常驻 / on=空闲缩零 / idle'
+        required: false
+        default: 'off'
+      restart:
+        description: '重启策略：never / on-failure / always'
+        required: false
+        default: 'on-failure'
+      kraft_cmd:
+        description: 'Kraftfile 启动命令（JSON 数组，默认适配 eooce/nodejs-argo）'
+        required: false
+        default: '["/usr/local/bin/node", "/tmp/index.js"]'
+      build_image:
+        description: '是否重新构建并推送镜像 true/false；多区域复用已有镜像时选 false'
+        required: false
+        default: 'true'
+      # ---- 以下是 eooce 代理节点环境变量（留空则读同名 Secret）----
+      UUID:
+        description: '节点 UUID（留空用默认，多个实例必须不同）'
+        required: false
+        default: ''
+      NAME:
+        description: '节点名称前缀'
+        required: false
+        default: ''
+      ARGO_PORT:
+        description: 'Argo 隧道端口（默认 8001）'
+        required: false
+        default: ''
+      ARGO_DOMAIN:
+        description: 'Argo 固定隧道域名（留空用临时隧道）'
+        required: false
+        default: ''
+      ARGO_AUTH:
+        description: 'Argo 固定隧道 token/json（须和 ARGO_DOMAIN 一起填）'
+        required: false
+        default: ''
+      SUB_PATH:
+        description: '订阅路径（默认 sub）'
+        required: false
+        default: ''
+      NEZHA_SERVER:
+        description: '哪吒 v1: nezha.xxx.com:8008 / v0: nezha.xxx.com'
+        required: false
+        default: ''
+      NEZHA_PORT:
+        description: '哪吒端口（仅 v0）'
+        required: false
+        default: ''
+      NEZHA_KEY:
+        description: '哪吒密钥（v1 的 NZ_CLIENT_SECRET 或 v0 agent key）'
+        required: false
+        default: ''
+      SHOW_LOG:
+        description: '是否显示日志 true/false'
+        required: false
+        default: ''
+      extra_env:
+        description: '其他环境变量，逗号分隔 KEY=VALUE（如 PROJECT_URL=...,FILE_PATH=./tmp）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BUILDKIT_HOST: unix:///run/buildkit/buildkitd.sock
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取应用源码
+        if: ${{ inputs.build_image == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          path: app
+
+      - name: 安装 Unikraft CLI
+        uses: unikraft/setup-action@main
+        with:
+          version: latest
+
+      - name: 登录 Unikraft Cloud
+        env:
+          UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
+        run: |
+          if [ -z "$UKC_TOKEN" ]; then
+            echo "::error::未配置 UKC_TOKEN，请在 Settings->Secrets 添加"
+            exit 1
+          fi
+          echo "$UKC_TOKEN" | unikraft login --token -
+
+      - name: 安装并启动 BuildKit
+        if: ${{ inputs.build_image == 'true' }}
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /run/buildkit /opt/buildkit
+          if [ ! -x /opt/buildkit/buildkitd ]; then
+            curl -fsSL https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-amd64.tar.gz -o /tmp/buildkit.tgz
+            sudo tar -xzf /tmp/buildkit.tgz -C /opt/buildkit --strip-components=1
+          fi
+          sudo nohup /opt/buildkit/buildkitd --addr unix:///run/buildkit/buildkitd.sock > /tmp/buildkitd.log 2>&1 &
+          for i in $(seq 1 60); do
+            [ -S /run/buildkit/buildkitd.sock ] && break
+            sleep 1
+          done
+          sudo chmod 666 /run/buildkit/buildkitd.sock
+          ls -l /run/buildkit/buildkitd.sock
+          /opt/buildkit/buildctl debug workers 2>/dev/null | head -8 || true
+
+      - name: 生成 Kraftfile（自动适配）
+        if: ${{ inputs.build_image == 'true' }}
+        working-directory: app
+        run: |
+          echo "--- 源码目录 ---"
+          ls -la
+          if [ ! -f Dockerfile ]; then
+            echo "::error::仓库缺少 Dockerfile"
+            exit 1
+          fi
+          CMD='${{ inputs.kraft_cmd }}'
+          echo "$CMD" | jq -e 'type == "array"' > /dev/null || {
+            echo "::error::kraft_cmd 必须是 JSON 数组，如 [\"/usr/local/bin/node\",\"/tmp/index.js\"]"
+            exit 1
+          }
+          # 用 printf 避免 heredoc 缩进问题
+          printf 'spec: v0.7\n\nruntime: base-compat:latest\n\nrootfs:\n  source: ./Dockerfile\n  format: erofs\n\ncmd: %s\n' "$CMD" > Kraftfile
+          echo "--- 生成的 Kraftfile ---"
+          cat Kraftfile
+
+      - name: 解析镜像与实例名
+        run: |
+          ORG="${{ inputs.image_org }}"
+          [ -z "$ORG" ] && ORG="${{ vars.UKC_IMAGE_ORG }}"
+          [ -z "$ORG" ] && ORG="${{ secrets.UKC_IMAGE_ORG }}"
+          [ -z "$ORG" ] && ORG=$(unikraft config get -o json 2>/dev/null | jq -r '.. | .organization? // empty' | head -n1)
+          if [ -z "$ORG" ]; then
+            echo "::error::未指定镜像组织：请填 image_org 参数，或设置变量/Secret UKC_IMAGE_ORG"
+            exit 1
+          fi
+          IMAGE_REF="$ORG/${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          echo "IMAGE_REF=$IMAGE_REF" >> "$GITHUB_ENV"
+          if [ -n "${{ inputs.app_name }}" ]; then
+            APP_NAME="${{ inputs.app_name }}"
+          else
+            APP_NAME="${{ inputs.image_name }}-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          fi
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+          echo "镜像: $IMAGE_REF"
+          echo "实例: $APP_NAME"
+
+      - name: 构建并发布镜像
+        if: ${{ inputs.build_image == 'true' }}
+        working-directory: app
+        run: |
+          EXTRA="--no-cache"
+          unikraft build . --output "$IMAGE_REF" $EXTRA
+
+      - name: 校验镜像
+        run: |
+          unikraft images get "$IMAGE_REF"
+
+      - name: 组装环境变量
+        run: |
+          PAIRS=""
+          add() {
+            local k="$1" v="$2"
+            if [ -n "$v" ]; then
+              PAIRS="${PAIRS:+$PAIRS,}$k=$v"
+            fi
+          }
+          add UUID      "${{ inputs.UUID || secrets.UUID }}"
+          add NAME      "${{ inputs.NAME || secrets.NAME }}"
+          add ARGO_PORT "${{ inputs.ARGO_PORT || secrets.ARGO_PORT }}"
+          add ARGO_DOMAIN "${{ inputs.ARGO_DOMAIN || secrets.ARGO_DOMAIN }}"
+          add ARGO_AUTH "${{ inputs.ARGO_AUTH || secrets.ARGO_AUTH }}"
+          add SUB_PATH  "${{ inputs.SUB_PATH || secrets.SUB_PATH }}"
+          add NEZHA_SERVER "${{ inputs.NEZHA_SERVER || secrets.NEZHA_SERVER }}"
+          add NEZHA_PORT "${{ inputs.NEZHA_PORT || secrets.NEZHA_PORT }}"
+          add NEZHA_KEY "${{ inputs.NEZHA_KEY || secrets.NEZHA_KEY }}"
+          add SHOW_LOG  "${{ inputs.SHOW_LOG || secrets.SHOW_LOG }}"
+          add CFIP      "${{ secrets.CFIP }}"
+          add CFPORT    "${{ secrets.CFPORT }}"
+          add CHAT_ID   "${{ secrets.CHAT_ID }}"
+          add BOT_TOKEN "${{ secrets.BOT_TOKEN }}"
+          EXTRA="${{ inputs.extra_env }}"
+          if [ -n "$EXTRA" ]; then
+            PAIRS="${PAIRS:+$PAIRS,}$EXTRA"
+          fi
+          echo "ENV_PAIRS=$PAIRS" >> "$GITHUB_ENV"
+          echo "环境变量: ${PAIRS:-（无）}"
+
+      - name: 删除同名旧实例（幂等）
+        env:
+          METRO: ${{ inputs.metro }}
+        run: |
+          INST_UUID=$(unikraft api "/v1/instances" --metro "$METRO" 2>/dev/null \
+            | jq -r --arg n "$APP_NAME" '.data.instances[]? | select(.name == $n) | .uuid' | head -n1)
+          if [ -n "$INST_UUID" ]; then
+            echo "发现同名实例 $APP_NAME ($INST_UUID)，先删除..."
+            unikraft api "/v1/instances/$INST_UUID" --metro "$METRO" -X DELETE || echo "删除失败，继续尝试部署"
+          else
+            echo "无同名实例，直接部署"
+          fi
+
+      - name: 部署实例
+        env:
+          METRO: ${{ inputs.metro }}
+          MEMORY: ${{ inputs.memory }}
+          VCPUS: ${{ inputs.vcpus }}
+          PUBLISH: ${{ inputs.publish }}
+          SCALE_TO_ZERO: ${{ inputs.scale_to_zero }}
+          RESTART: ${{ inputs.restart }}
+        run: |
+          ARGS=(run --metro "$METRO" --image "$IMAGE_REF" -n "$APP_NAME" \
+                -m "$MEMORY" --vcpus "$VCPUS" \
+                -p "$PUBLISH" \
+                --scale-to-zero "policy=$SCALE_TO_ZERO" \
+                --restart "$RESTART" --autostart)
+          if [ -n "$ENV_PAIRS" ]; then
+            IFS=',' read -ra PAIRS <<< "$ENV_PAIRS"
+            for pair in "${PAIRS[@]}"; do
+              [ -n "$pair" ] && ARGS+=(-e "$pair")
+            done
+          fi
+          echo "执行: unikraft ${ARGS[*]}"
+          unikraft "${ARGS[@]}"
+
+      - name: 验证服务并输出信息
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+
+          SUB_PATH_VALUE=$(printf '%s' "$ENV_PAIRS" | tr ',' '\n' | sed -n 's/^SUB_PATH=//p' | head -n1)
+          [ -z "$SUB_PATH_VALUE" ] && SUB_PATH_VALUE="sub"
+          if echo "$PUBLISH" | grep -q 'tls'; then SCHEME="https"; else SCHEME="http"; fi
+
+          STATE="unknown"
+          FQDN=""
+          CODE="skipped"
+          LOGS=""
+          HEALTHY="0"
+
+          # unikraft run --autostart 已完成实例创建和启动请求；这里不再用公网 curl 判定部署成败。
+          # GitHub Actions runner 到 unikraft.app/CDN 的网络路径可能被拦截或超时，curl 会表现为 HTTP=000。
+          for i in $(seq 1 24); do
+            unikraft instances get "$APP_NAME" -o json > /tmp/inst.json 2>/dev/null || true
+            FQDN=$(jq -r '.. | .fqdn? // empty' /tmp/inst.json 2>/dev/null | head -n1 || true)
+            STATE=$(jq -r '.. | .state? // empty' /tmp/inst.json 2>/dev/null | head -n1 || true)
+            [ -z "$STATE" ] && STATE="unknown"
+
+            LOGS=$(unikraft instances logs "$APP_NAME" 2>/dev/null || true)
+            if grep -q 'App is running' <<< "$LOGS"; then
+              HEALTHY="1"
+              break
+            fi
+
+            if [ "$STATE" = "stopped" ] || [ "$STATE" = "stopping" ]; then
+              break
+            fi
+
+            echo "第 $i 次检查 state=$STATE，尚未看到 App is running，等待 5s..."
+            sleep 5
+          done
+
+          echo "实例: $APP_NAME  状态: $STATE  日志健康: $HEALTHY"
+
+          if [ "$STATE" = "stopped" ] || [ "$STATE" = "stopping" ]; then
+            printf '%s\n' "$LOGS"
+            echo "::error::实例启动后已停止（state=$STATE）"
+            exit 1
+          fi
+
+          if [ "$HEALTHY" != "1" ]; then
+            printf '%s\n' "$LOGS"
+            echo "::error::实例日志未出现 App is running，不能确认应用已启动"
+            exit 1
+          fi
+
+          if [ -n "$FQDN" ]; then
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$SCHEME://$FQDN/$SUB_PATH_VALUE" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "公网探测成功: HTTP=$CODE"
+            else
+              echo "::warning::公网 curl 未返回 200（HTTP=$CODE）。实例日志已确认 App is running，可能是 GitHub Actions runner 到 Unikraft CDN/防火墙的网络路径不可达。"
+            fi
+          else
+            echo "::warning::未能从实例信息解析 FQDN，但实例日志已确认 App is running。"
+          fi
+
+          if [ -n "$FQDN" ]; then
+            echo "App url: $SCHEME://$FQDN"
+            echo "节点订阅链接: $SCHEME://$FQDN/$SUB_PATH_VALUE"
+          fi
+
+          {
+            echo "## 部署完成"
+            echo "- 实例：\`$APP_NAME\`（状态 $STATE）"
+            echo "- 镜像：\`$IMAGE_REF\`"
+            echo "- 日志健康：已出现 \`App is running\`"
+            if [ -n "$FQDN" ]; then
+              echo "- **App url**：$SCHEME://$FQDN"
+              echo "- **节点订阅链接**：$SCHEME://$FQDN/$SUB_PATH_VALUE"
+            else
+              echo "- **App url**：未解析到 FQDN"
+            fi
+            echo "- 公网探测：HTTP $CODE（仅供参考，不作为部署失败依据）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ARGO_URL=$(printf '%s\n' "$LOGS" | grep -oE 'https?://[a-z0-9-]+\.trycloudflare\.com' | head -n1 || true)
+          if [ -n "$ARGO_URL" ]; then
+            echo "临时隧道: $ARGO_URL"
+            echo "隧道订阅链接: $ARGO_URL/$SUB_PATH_VALUE"
+            echo "- 临时隧道：$ARGO_URL" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 隧道订阅：$ARGO_URL/$SUB_PATH_VALUE" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "--- 实例日志 ---"
+          printf '%s\n' "$LOGS"
+
+
+
